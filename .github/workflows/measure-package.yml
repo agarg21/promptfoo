@@ -79,13 +79,23 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      npm_config_cache: ${{ github.workspace }}/.artifact-npm-cache
     steps:
     - name: Require successful package build
       env:
         PACKAGE_BUILD_RESULT: ${{ needs.package-build.result }}
       run: test "$PACKAGE_BUILD_RESULT" = success
+    - name: Use a Dev Drive for npm cache and temp (Windows)
+      if: runner.os == 'Windows'
+      uses: samypr100/setup-dev-drive@v3
+      with:
+        drive-size: 8GB
+        env-mapping: 'npm_config_cache,{{ DEV_DRIVE }}/npm-cache
+
+          TEMP,{{ DEV_DRIVE }}/tmp
+
+          TMP,{{ DEV_DRIVE }}/tmp
+
+          '
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       with: *id002
     - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
