@@ -1,0 +1,112 @@
+# fork-only measurement harness: package-build + the Windows artifact-consumer leg of main.yml (anchors expanded), dispatch-only
+name: CI package (measure)
+'on':
+  workflow_dispatch: null
+permissions: &id001
+  contents: read
+env:
+  VITE_TELEMETRY_DISABLED: 1
+  NPM_CONFIG_AUDIT: 'false'
+jobs:
+  package-build:
+    name: Prepare package on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: *id001
+    env:
+      PROMPTFOO_POSTHOG_KEY: ${{ secrets.PROMPTFOO_POSTHOG_KEY }}
+    strategy:
+      matrix:
+        node:
+        - 24.x
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      with: &id002
+        persist-credentials: false
+    - name: Use Node ${{ matrix.node }}
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+      with:
+        node-version: ${{ matrix.node == '22.22' && '22.22.0' || matrix.node }}
+        cache: npm
+    - &id003
+      name: Use npm 11
+      run: npm install -g npm@11.11.0 --registry=https://registry.npmjs.org/
+    - name: Install Dependencies
+      run: npm ci ${{ matrix.node == '26.x' && '--ignore-scripts' || '' }} --registry=https://registry.npmjs.org/
+    - name: Build
+      run: npm run build
+    - name: Check Telemetry
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+        REPOSITORY: ${{ github.repository }}
+      run: "# Skip PostHog key check for forks as they don't have access to secrets\nif [[ \"$EVENT_NAME\" == \"pull_request\" ]] && [[ \"$HEAD_REPO_FULL_NAME\" != \"$REPOSITORY\" ]]; then\n  echo \"Skipping\
+        \ PostHog key check for fork PR\"\nelif [[ -z \"$PROMPTFOO_POSTHOG_KEY\" ]]; then\n  echo \"PostHog key not available (running without secret), skipping check\"\nelse\n  # PostHog key is injected\
+        \ at build time via tsup's define option\n  # Check that it's present in the built output (it will be inlined as a string)\n  if ! grep -rq '\"phc_' dist/src/*.js; then\n    echo \"Error: PostHog\
+        \ key not found in built output\"\n    echo \"Checking for POSTHOG_KEY patterns in built files:\"\n    grep -r \"POSTHOG_KEY\" dist/src/*.js | head -10 || echo \"No POSTHOG_KEY found\"\n    exit\
+        \ 1\n  fi\n  echo \"PostHog key replacement verified successfully\"\nfi\n"
+    - name: Pack Package Artifact
+      id: package-artifact
+      run: 'tarball="$(npm run --silent package:pack -- --destination "$RUNNER_TEMP/package-artifact")"
+
+        echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+        '
+    - name: Run built agent skill examples
+      env:
+        PROMPTFOO_POSTHOG_KEY: ''
+      run: npm run test:smoke -- test/smoke/agent-skill-examples.test.ts
+    - name: Upload package for platform acceptance
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: promptfoo-platform-package
+        path: ${{ steps.package-artifact.outputs.tarball }}
+        if-no-files-found: error
+        retention-days: 7
+  artifact-consumer:
+    name: Installed package on ${{ matrix.os }}
+    needs: package-build
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'windows-2025-vs2026' && 40 || 20 }}
+    permissions: *id001
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+        - windows-2025-vs2026
+    defaults:
+      run:
+        shell: bash
+    env:
+      npm_config_cache: ${{ github.workspace }}/.artifact-npm-cache
+    steps:
+    - name: Require successful package build
+      env:
+        PACKAGE_BUILD_RESULT: ${{ needs.package-build.result }}
+      run: test "$PACKAGE_BUILD_RESULT" = success
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      with: *id002
+    - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+      with:
+        node-version: 22.22.0
+    - *id003
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: promptfoo-platform-package
+        path: ${{ runner.temp }}/package-artifact
+    - name: Prepare isolated artifact tooling
+      id: prepare
+      env:
+        ARTIFACT_DIRECTORY: ${{ runner.temp }}/package-artifact
+      run: node scripts/preparePackageArtifactTest.mjs --artifact-directory "$ARTIFACT_DIRECTORY"
+    - name: Install isolated artifact tooling
+      working-directory: ${{ steps.prepare.outputs.tooling }}
+      run: npm ci --ignore-scripts --include=optional --no-audit --no-fund --registry=https://registry.npmjs.org/
+    - name: Test the downloaded package
+      working-directory: ${{ steps.prepare.outputs.tooling }}
+      env:
+        PACKAGE_TARBALL: ${{ steps.prepare.outputs.tarball }}
+        PROMPTFOO_DISABLE_TELEMETRY: 1
+      run: npm run test:artifact -- --tarball "$PACKAGE_TARBALL"
